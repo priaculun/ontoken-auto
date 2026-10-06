@@ -3,6 +3,22 @@ import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
+const THINKING_ORDER: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** Optional per-slot ceiling, e.g. { "frontier": "high" } — clamps any rule level above it. */
+export type MaxThinkingMap = Partial<Record<SlotName, ThinkingLevel>>;
+
+function normalizeMaxThinking(value: unknown): MaxThinkingMap | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const out: MaxThinkingMap = {};
+	for (const [slot, level] of Object.entries(value as Record<string, unknown>)) {
+		if (typeof level === "string" && (THINKING_ORDER as string[]).includes(level)) {
+			out[slot as SlotName] = level as ThinkingLevel;
+		}
+	}
+	return Object.keys(out).length ? out : undefined;
+}
+
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type SlotName = "fast" | "work" | "solid" | "strong" | "frontier";
 export type BudgetName = "cheap" | "balanced" | "quality";
@@ -41,6 +57,8 @@ export interface AutoConfig {
 	budgets: Record<BudgetName, { ceiling: SlotName; promoteEarly: boolean }>;
 	directSlot: SlotName;
 	fallbackSlot: SlotName;
+	/** Optional per-slot thinking ceiling applied after rule selection. */
+	maxThinking?: MaxThinkingMap;
 	rules: RouteRule[];
 }
 
@@ -91,6 +109,7 @@ export function loadConfig(cwd?: string): AutoConfig {
 		const project = readJson(projectConfigPath(cwd));
 		if (project) cfg = deepMerge(cfg, project);
 	}
+	cfg.maxThinking = normalizeMaxThinking(cfg.maxThinking);
 	return cfg;
 }
 

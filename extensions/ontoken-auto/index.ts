@@ -30,6 +30,33 @@ import {
 
 const THINKING: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
+/**
+ * Downgrade a thinking level to one the target model actually supports.
+ *
+ * A model declares unsupported levels via `thinkingLevelMap[level] === null`.
+ * If the map is absent we assume all levels pass through, but an optional
+ * per-slot `maxThinking` clamp in the overlay config can still cap them
+ * (useful for servers whose effort enum is narrower than pi's levels).
+ */
+function supportedThinking(
+	model: { thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>; reasoning?: boolean },
+	wanted: ThinkingLevel,
+	maxThinking?: ThinkingLevel,
+): ThinkingLevel {
+	let cap = THINKING.indexOf(wanted);
+	if (cap < 0) cap = THINKING.indexOf("high");
+	const maxIdx = maxThinking ? THINKING.indexOf(maxThinking) : -1;
+	if (maxIdx >= 0 && maxIdx < cap) cap = maxIdx;
+	const map = model.thinkingLevelMap;
+	if (model.reasoning === false) return "off";
+	if (!map) return THINKING[cap] as ThinkingLevel;
+	for (let i = cap; i >= 0; i--) {
+		const level = THINKING[i] as ThinkingLevel;
+		if (map[level] !== null) return level;
+	}
+	return "off";
+}
+
 let lastExplain = "no routing yet this process";
 
 interface Verdict {
@@ -266,13 +293,14 @@ function routeTo(
 	state?: AutoState,
 ): ModelRoute<AutoState> {
 	const resolved = resolveModel(ctx, cfg, slot);
+	const applied = supportedThinking(resolved.model, thinking, cfg.maxThinking?.[resolved.slot]);
 	return {
 		model: resolved.model,
-		thinkingLevel: thinking,
+		thinkingLevel: applied,
 		state: state ?? {
 			slot: resolved.slot,
 			modelId: resolved.model.id,
-			thinking,
+			thinking: applied,
 			budget: cfg.budget,
 		},
 	};
@@ -340,7 +368,11 @@ export default function (pi: ExtensionAPI) {
 					`${src} ${verdict.task} d${verdict.difficulty} → ${resolved.model.id} · ${picked.thinking}`,
 				);
 			}
-			return { model: resolved.model, thinkingLevel: picked.thinking, state };
+			return {
+				model: resolved.model,
+				thinkingLevel: supportedThinking(resolved.model, picked.thinking, cfg.maxThinking?.[resolved.slot]),
+				state,
+			};
 		},
 	});
 
