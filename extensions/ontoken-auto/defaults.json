@@ -1,0 +1,80 @@
+{
+  "enabled": true,
+  "budget": "balanced",
+  "provider": "ontoken",
+  "virtual": {
+    "provider": "ontoken",
+    "id": "auto",
+    "name": "Auto (Jev · OnToken)"
+  },
+  "jev": {
+    "classifierProvider": "typesafe",
+    "classifierId": "jev-latest",
+    "promptChars": 16000
+  },
+  "slots": {
+    "fast": "gpt-6-luna",
+    "work": "glm-5.3-flash",
+    "solid": "muse-spark-1.3",
+    "strong": "claude-sonnet-5.5",
+    "frontier": "claude-opus-5.5"
+  },
+  "slotOrder": ["fast", "work", "solid", "strong", "frontier"],
+  "budgets": {
+    "cheap": { "ceiling": "solid", "promoteEarly": false },
+    "balanced": { "ceiling": "frontier", "promoteEarly": false },
+    "quality": { "ceiling": "frontier", "promoteEarly": true }
+  },
+  "directSlot": "fast",
+  "fallbackSlot": "work",
+  "rules": [
+    {
+      "id": "chat-trivial",
+      "when": { "taskIn": ["chat", "lookup"], "maxDifficulty": 0, "needsReasoning": false },
+      "slot": "fast",
+      "thinking": "off"
+    },
+    {
+      "id": "mechanical-or-routine-coding",
+      "when": { "taskIn": ["mechanical", "coding", "review"], "maxDifficulty": 1 },
+      "slot": "work",
+      "thinking": "low"
+    },
+    {
+      "id": "involved-coding",
+      "when": { "taskIn": ["coding", "review", "research", "mechanical"], "maxDifficulty": 2 },
+      "slot": "work",
+      "thinking": "high"
+    },
+    {
+      "id": "hard-debug-design",
+      "when": { "taskIn": ["debug", "design", "research"], "minDifficulty": 3, "maxDifficulty": 3 },
+      "slot": "solid",
+      "thinking": "high"
+    },
+    {
+      "id": "quality-hard-promote",
+      "when": { "minDifficulty": 3, "budgetPromoteEarly": true },
+      "slot": "strong",
+      "thinking": "high"
+    },
+    {
+      "id": "frontier-sonnet",
+      "when": { "minDifficulty": 4 },
+      "slot": "strong",
+      "thinking": "high"
+    },
+    {
+      "id": "frontier-opus",
+      "when": { "minDifficulty": 4, "needsReasoning": true },
+      "slot": "frontier",
+      "thinking": "xhigh"
+    },
+    {
+      "id": "frontier-opus-max",
+      "when": { "minDifficulty": 4, "needsReasoning": true, "minConfidence": 0.7 },
+      "slot": "frontier",
+      "thinking": "max"
+    }
+  ]
+}
