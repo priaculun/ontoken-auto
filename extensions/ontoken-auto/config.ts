@@ -41,6 +41,83 @@ export interface RouteRule {
 	thinking: ThinkingLevel;
 }
 
+/**
+ * Failover on transient provider errors: on `reason: "retry"`, move the turn to
+ * the next slot in the chain instead of re-hitting the same broken model.
+ */
+export interface FailoverConfig {
+	enabled: boolean;
+	/** Explicit per-slot chain. Missing slots use the automatic chain (other slots, strongest first). */
+	chain?: Partial<Record<SlotName, SlotName[]>>;
+}
+
+function normalizeFailover(value: unknown): FailoverConfig {
+	const base: FailoverConfig = { enabled: true };
+	if (!value || typeof value !== "object" || Array.isArray(value)) return base;
+	const v = value as Record<string, unknown>;
+	const out: FailoverConfig = { enabled: v.enabled !== false };
+	if (v.chain && typeof v.chain === "object" && !Array.isArray(v.chain)) {
+		const chain: Partial<Record<SlotName, SlotName[]>> = {};
+		for (const [slot, list] of Object.entries(v.chain as Record<string, unknown>)) {
+			if (Array.isArray(list)) {
+				const slots = list.filter((s): s is SlotName =>
+					["fast", "work", "solid", "strong", "frontier"].includes(s as string),
+				);
+				if (slots.length) chain[slot as SlotName] = slots;
+			}
+		}
+		if (Object.keys(chain).length) out.chain = chain;
+	}
+	return out;
+}
+
+export interface AdaptiveConfig {
+	/** Include recent conversation text when the latest user prompt is short or referential. */
+	contextAware: boolean;
+	/** Latest user prompts at or below this length receive recent conversation context. */
+	shortPromptChars: number;
+	/** Reclassify continuations after tool results and only promote to a stronger slot. */
+	midTurn: boolean;
+	/** Maximum Jev continuation evaluations within one user turn. */
+	maxEvaluationsPerTurn: number;
+	/** Require this many new tool results since the previous adaptive evaluation. */
+	toolResultsPerEvaluation: number;
+}
+
+function normalizeAdaptive(value: unknown): AdaptiveConfig {
+	const base: AdaptiveConfig = {
+		contextAware: true,
+		shortPromptChars: 800,
+		midTurn: true,
+		maxEvaluationsPerTurn: 2,
+		toolResultsPerEvaluation: 2,
+	};
+	if (!value || typeof value !== "object" || Array.isArray(value)) return base;
+	const v = value as Record<string, unknown>;
+	return {
+		contextAware: v.contextAware !== false,
+		shortPromptChars: Math.max(
+			80,
+			Math.round(Number.isFinite(Number(v.shortPromptChars)) ? Number(v.shortPromptChars) : base.shortPromptChars),
+		),
+		midTurn: v.midTurn !== false,
+		maxEvaluationsPerTurn: Math.max(
+			0,
+			Math.min(
+				5,
+				Math.round(Number.isFinite(Number(v.maxEvaluationsPerTurn)) ? Number(v.maxEvaluationsPerTurn) : base.maxEvaluationsPerTurn),
+			),
+		),
+		toolResultsPerEvaluation: Math.max(
+			1,
+			Math.min(
+				10,
+				Math.round(Number.isFinite(Number(v.toolResultsPerEvaluation)) ? Number(v.toolResultsPerEvaluation) : base.toolResultsPerEvaluation),
+			),
+		),
+	};
+}
+
 export interface AutoConfig {
 	enabled: boolean;
 	budget: BudgetName;
@@ -59,6 +136,8 @@ export interface AutoConfig {
 	fallbackSlot: SlotName;
 	/** Optional per-slot thinking ceiling applied after rule selection. */
 	maxThinking?: MaxThinkingMap;
+	adaptive: AdaptiveConfig;
+	failover: FailoverConfig;
 	rules: RouteRule[];
 }
 
@@ -110,6 +189,8 @@ export function loadConfig(cwd?: string): AutoConfig {
 		if (project) cfg = deepMerge(cfg, project);
 	}
 	cfg.maxThinking = normalizeMaxThinking(cfg.maxThinking);
+	cfg.adaptive = normalizeAdaptive(cfg.adaptive);
+	cfg.failover = normalizeFailover(cfg.failover);
 	return cfg;
 }
 

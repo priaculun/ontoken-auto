@@ -15,7 +15,7 @@
   "slots": {
     "fast": "gpt-6-luna",
     "work": "glm-5.3-flash",
-    "solid": "muse-spark-1.3",
+    "solid": "kimi-k3",
     "strong": "claude-sonnet-5.5",
     "frontier": "claude-opus-5.5"
   },
@@ -27,6 +27,16 @@
   },
   "directSlot": "fast",
   "fallbackSlot": "work",
+  "adaptive": {
+    "contextAware": true,
+    "shortPromptChars": 800,
+    "midTurn": true,
+    "maxEvaluationsPerTurn": 2,
+    "toolResultsPerEvaluation": 2
+  },
+  "failover": {
+    "enabled": true
+  },
   "rules": [
     {
       "id": "chat-trivial",

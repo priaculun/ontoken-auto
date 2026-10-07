@@ -2,7 +2,7 @@
 
 Pi package: virtual model **`ontoken/auto`**. TypeSafe Jev classifies each user prompt, then this extension picks an [OnToken](https://ontoken.id) model and thinking level.
 
-Tool follow-ups and retries stay on the same model (prompt cache). Compaction / `direct` uses the `fast` slot.
+Short follow-up prompts inherit recent conversation context. During an agent turn, Jev may reassess after tool results and promote the work to a stronger slot; otherwise follow-ups stay on the same model to preserve the prompt cache. Compaction / `direct` uses the `fast` slot.
 
 ## Install (any machine)
 
@@ -54,6 +54,61 @@ Without a key the router still works: heuristic fallback, thinking `low` if clas
 /auto slot <fast|work|solid|strong|frontier> <model-id>
 ```
 
+## Adaptive routing
+
+By default, user prompts up to 800 characters are classified together with recent
+user/assistant context, so short replies such as `lanjut`, `fix itu`, or
+`implementasikan` retain the original task. Text sent to TypeSafe Jev is capped
+by `jev.promptChars` (16,000 by default).
+
+Within the same agent turn, the router reassesses after every two new tool
+results, at most twice. It can only promote to a stronger available slot; it
+never downgrades mid-turn, and heuristic fallback cannot trigger promotion.
+A promotion changes the physical model and therefore accepts one prompt-cache
+miss in exchange for stronger handling of newly discovered complexity.
+
+Conversation and tool-result text sent to Jev receives best-effort redaction of
+common bearer tokens, credential assignments, URL passwords, and private keys.
+Redaction is not a security boundary: disable context or mid-turn classification
+for sensitive workloads.
+
+```json
+{
+  "adaptive": {
+    "contextAware": true,
+    "shortPromptChars": 800,
+    "midTurn": true,
+    "maxEvaluationsPerTurn": 2,
+    "toolResultsPerEvaluation": 2
+  }
+}
+```
+
+Set `contextAware` or `midTurn` to `false` in a global/project overlay to disable
+that behavior.
+
+## Failover
+
+When a dispatched model fails with a transient error (5xx, 429/rate limit,
+overloaded, timeout, network), the next retry moves the turn to another slot
+instead of re-hitting the broken model. Auth, quota, billing errors, and user
+aborts are **not** failed over. Failover respects the budget ceiling and never
+returns to a slot that already failed this turn. Routing state records the
+switch (`ruleId` gains `+failover`), and `/auto explain` shows the last
+failover decision.
+
+Defaults: enabled, automatic chain = remaining slots ordered strongest-first.
+Explicit chains per slot (overlay, same files as below):
+
+```json
+{
+  "failover": {
+    "enabled": true,
+    "chain": { "work": ["solid", "fast"], "fast": ["work"] }
+  }
+}
+```
+
 ## Change roster / rules without editing code
 
 Merge overlay (only keys you change):
@@ -85,7 +140,7 @@ Cap a repo:
 |---|---|---|
 | fast | `gpt-6-luna` | chat / lookup, thinking off |
 | work | `glm-5.3-flash` | routine–involved coding |
-| solid | `muse-spark-1.3` | hard debug / design |
+| solid | `kimi-k3` | hard debug / design |
 | strong | `claude-sonnet-5.5` | frontier |
 | frontier | `claude-opus-5.5` | frontier + heavy reasoning |
 

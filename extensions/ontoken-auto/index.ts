@@ -77,6 +77,14 @@ interface AutoState {
 	budget: BudgetName;
 	verdict?: Verdict;
 	ruleId?: string;
+	/** Slot already failed this turn and excluded from failover. */
+	failoverTried?: SlotName[];
+	/** True when the current slot was reached via failover. */
+	failedOver?: boolean;
+	/** Number of adaptive Jev evaluations already performed in the current user turn. */
+	adaptiveEvaluations?: number;
+	/** Tool-result count at the previous adaptive evaluation. */
+	adaptiveToolResults?: number;
 }
 
 type AutoRequest = ModelRouteRequest<AutoState>;
@@ -91,6 +99,95 @@ function userHasImage(messages: readonly Message[]): boolean {
 	const last = messages.filter((m) => m.role === "user").at(-1);
 	if (!last || typeof last.content === "string") return false;
 	return last.content.some((b) => b.type === "image");
+}
+
+function contentText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content.flatMap((block) => {
+		if (!block || typeof block !== "object") return [];
+		const b = block as Record<string, unknown>;
+		if (b.type === "text" && typeof b.text === "string") return [b.text];
+		return [];
+	}).join("\n");
+}
+
+function clippedTail(text: string, max: number): string {
+	if (max <= 1) return "…";
+	if (text.length <= max) return text;
+	return `…${text.slice(-(max - 1))}`;
+}
+
+/** Best-effort redaction before conversation/tool text leaves the Pi process. */
+function redactClassifierText(text: string): string {
+	return text
+		.replace(/-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\n]*PRIVATE KEY-----/gi, "[REDACTED PRIVATE KEY]")
+		.replace(/\b(Bearer)\s+[A-Za-z0-9._~+\/-]+=*/gi, "$1 [REDACTED]")
+		.replace(/\b((?:api[_-]?key|access[_-]?token|auth[_-]?token|password|passwd|secret)\s*[:=]\s*)[^\s,;]+/gi, "$1[REDACTED]")
+		.replace(/([a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:)[^\s@/]+@/gi, "$1[REDACTED]@");
+}
+
+/**
+ * Classification input for a new user turn. Short/referential prompts receive
+ * recent user/assistant context so users can naturally say "lanjut" or
+ * "kerjakan itu" without causing the router to forget the actual task.
+ */
+function contextualUserPrompt(messages: readonly Message[], cfg: AutoConfig): string {
+	const latest = redactClassifierText(lastUserText(messages).trim());
+	if (!cfg.adaptive.contextAware || latest.length > cfg.adaptive.shortPromptChars) {
+		return latest.slice(0, cfg.jev.promptChars);
+	}
+	const prior = messages.filter((m) => m.role === "user" || m.role === "assistant").slice(0, -1);
+	const sections: string[] = [`CURRENT USER REQUEST:\n${latest}`];
+	let remaining = Math.max(0, cfg.jev.promptChars - sections[0].length - 2);
+	for (let i = prior.length - 1; i >= 0 && remaining > 80; i--) {
+		const message = prior[i] as Message & { role: string; content?: unknown };
+		const text = redactClassifierText(contentText(message.content).trim());
+		if (!text) continue;
+		const label = message.role === "user" ? "PREVIOUS USER" : "PREVIOUS ASSISTANT";
+		const section = `${label}:\n${clippedTail(text, Math.min(4000, remaining - label.length - 3))}`;
+		sections.unshift(section);
+		remaining -= section.length + 2;
+	}
+	return sections.join("\n\n").slice(-cfg.jev.promptChars);
+}
+
+function currentTurnToolResults(messages: readonly Message[]): number {
+	const lastUser = messages.findLastIndex((m) => m.role === "user");
+	return messages.slice(lastUser + 1).filter((m) => m.role === "toolResult").length;
+}
+
+/** Classification input used after tool progress within the current turn. */
+function adaptiveProgressPrompt(messages: readonly Message[], cfg: AutoConfig): string {
+	const lastUser = messages.findLastIndex((m) => m.role === "user");
+	const before = messages.slice(0, lastUser + 1);
+	const progress = messages.slice(lastUser + 1);
+	const maxChars = Math.max(1000, cfg.jev.promptChars);
+	const instruction = "Reassess the remaining work using the original task plus evidence discovered so far.";
+	// Reserve roughly half the classifier budget for the task. A final tail slice
+	// would otherwise let long tool output erase the objective entirely.
+	const objective = clippedTail(contextualUserPrompt(before, cfg), Math.floor(maxChars * 0.55));
+	const heading = `TASK AND RECENT CONTEXT:\n${objective}\n\nCURRENT-TURN PROGRESS:`;
+	let remaining = Math.max(0, maxChars - heading.length - instruction.length - 4);
+	const progressSections: string[] = [];
+	for (let i = progress.length - 1; i >= 0 && remaining > 80; i--) {
+		const message = progress[i] as Message & {
+			role: string;
+			content?: unknown;
+			toolName?: string;
+			isError?: boolean;
+		};
+		const text = redactClassifierText(contentText(message.content).trim());
+		if (!text) continue;
+		const label = message.role === "toolResult"
+			? `TOOL ${message.toolName ?? "unknown"}${message.isError ? " ERROR" : ""}`
+			: message.role === "assistant" ? "ASSISTANT PROGRESS" : undefined;
+		if (!label) continue;
+		const section = `${label}:\n${clippedTail(text, Math.min(1800, remaining - label.length - 3))}`;
+		progressSections.unshift(section);
+		remaining -= section.length + 2;
+	}
+	return [heading, ...progressSections, instruction].join("\n\n").slice(0, maxChars);
 }
 
 function heuristic(prompt: string, hasImage: boolean): Verdict {
@@ -123,8 +220,9 @@ async function classify(
 	request: AutoRequest,
 	ctx: ExtensionContext,
 	cfg: AutoConfig,
+	promptOverride?: string,
 ): Promise<Verdict> {
-	const prompt = lastUserText(request.messages).slice(0, cfg.jev.promptChars);
+	const prompt = (promptOverride ?? contextualUserPrompt(request.messages, cfg)).slice(0, cfg.jev.promptChars);
 	const hasImage = userHasImage(request.messages);
 	if (!ensureJevKey(cfg)) {
 		return { ...heuristic(prompt, hasImage), error: "no TypeSafe key" };
@@ -306,6 +404,10 @@ function routeTo(
 	};
 }
 
+function strongerThinking(a: ThinkingLevel, b: ThinkingLevel): ThinkingLevel {
+	return THINKING.indexOf(a) >= THINKING.indexOf(b) ? a : b;
+}
+
 function formatVerdict(v: Verdict, ruleId: string, slot: SlotName, modelId: string, thinking: string): string {
 	return [
 		`source ${v.source}${v.error ? ` (${v.error})` : ""}`,
@@ -313,6 +415,50 @@ function formatVerdict(v: Verdict, ruleId: string, slot: SlotName, modelId: stri
 		`confidence ${v.confidence.toFixed(2)}  rule ${ruleId}`,
 		`→ ${slot}  ${modelId}  thinking ${thinking}`,
 	].join("\n");
+}
+
+/**
+ * Transient provider failures worth failing over for. Auth/quota/billing errors
+ * and aborts are NOT transient — failing over would just burn another slot.
+ */
+function isFailoverWorthy(message: ModelRouteRequest<AutoState>["failed"]): boolean {
+	if (!message) return false;
+	const stop = message.message?.stopReason;
+	if (stop === "aborted") return false;
+	const err = (message.message?.errorMessage ?? "").toLowerCase();
+	if (!err) return stop === "error";
+	if (/\b(401|403|invalid api key|authentication|unauthorized|api key|quota|billing|payment|credit)\b/.test(err)) {
+		return false;
+	}
+	// 5xx, 429, overloaded, timeout, network errors — the transient family.
+	return /\b(429|5[0-9][0-9]|overloaded|rate limit|too many requests|timeout|timed out|econn|enotfound|econnreset|econnrefused|etimedout|socket|network|temporarily|unavailable|bad gateway|service unavailable|internal server error)\b/.test(err)
+		|| stop === "error";
+}
+
+/**
+ * Pick the failover target for a failed slot: the explicit chain if configured,
+ * otherwise every other slot ordered strongest-first. Already-tried slots,
+ * models missing from the catalog, and the budget ceiling are respected.
+ */
+function failoverTarget(
+	request: AutoRequest,
+	ctx: ExtensionContext,
+	cfg: AutoConfig,
+	state: AutoState,
+): { model: NonNullable<ModelRoute<AutoState>["model"]>; slot: SlotName; thinking: ThinkingLevel } | undefined {
+	const failedSlot = state.slot;
+	const tried = new Set([...(state.failoverTried ?? []), failedSlot]);
+	const chain = cfg.failover.chain?.[failedSlot]
+		?? [...cfg.slotOrder].reverse().filter((s) => s !== failedSlot);
+	const budgetCeiling = cfg.budgets[state.budget]?.ceiling ?? "frontier";
+	for (const candidate of chain) {
+		if (tried.has(candidate)) continue;
+		if (slotIndex(cfg, candidate) > slotIndex(cfg, budgetCeiling)) continue;
+		const model = ctx.modelRegistry.find(cfg.provider, cfg.slots[candidate]);
+		if (!model) continue;
+		return { model, slot: candidate, thinking: state.thinking };
+	}
+	return undefined;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -331,15 +477,99 @@ export default function (pi: ExtensionAPI) {
 			if (request.reason === "direct") {
 				return routeTo(request, ctx, cfg, cfg.directSlot, "low");
 			}
+			// Failover: pi retries failed requests with reason "retry". If the failed
+			// request belongs to this router and the error is transient, move the turn
+			// to the next slot in the failover chain instead of re-hitting it.
+			if (request.reason === "retry" && request.state && request.failed) {
+				const state = request.state;
+				const failedBelongsToRouter = state.modelId === request.failed.model.id;
+				if (cfg.failover.enabled && failedBelongsToRouter && isFailoverWorthy(request.failed)) {
+					const target = failoverTarget(request, ctx, cfg, state);
+					if (target) {
+						const nextState: AutoState = {
+							...state,
+							slot: target.slot,
+							modelId: target.model.id,
+							failoverTried: [...(state.failoverTried ?? []), state.slot],
+							failedOver: true,
+							ruleId: `${state.ruleId ?? "fallback"}+failover`,
+						};
+						lastExplain = [
+							`failover: ${state.modelId} failed (${request.failed.message?.errorMessage ?? "error"})`,
+							`→ ${target.slot}  ${target.model.id}  thinking ${state.thinking}`,
+						].join("\n");
+						if (ctx.hasUI) {
+							ctx.ui.setStatus(
+								"ontoken-auto",
+								`failover ${state.modelId} → ${target.model.id}`,
+							);
+						}
+						return {
+							model: target.model,
+							thinkingLevel: supportedThinking(target.model, target.thinking, cfg.maxThinking?.[target.slot]),
+							state: nextState,
+						};
+					}
+					lastExplain = `failover: no available slot left for ${state.modelId} (${request.failed.message?.errorMessage ?? "error"})`;
+				}
+				// Not transient or nothing to fail over to: retry the same slot.
+				return routeTo(request, ctx, cfg, state.slot, state.thinking, state);
+			}
+			if (request.reason === "continuation" && request.state) {
+				const state = request.state;
+				const toolResults = currentTurnToolResults(request.messages);
+				const evaluations = state.adaptiveEvaluations ?? 0;
+				const previousToolResults = state.adaptiveToolResults ?? 0;
+				const enoughProgress = toolResults - previousToolResults >= cfg.adaptive.toolResultsPerEvaluation;
+				if (
+					cfg.adaptive.midTurn &&
+					!state.failedOver &&
+					evaluations < cfg.adaptive.maxEvaluationsPerTurn &&
+					enoughProgress
+				) {
+					const verdict = await classify(request, ctx, cfg, adaptiveProgressPrompt(request.messages, cfg));
+					const picked = pickRoute(cfg, verdict, state.budget);
+					const requestedPromotion = verdict.source === "jev"
+						&& slotIndex(cfg, picked.slot) > slotIndex(cfg, state.slot);
+					const resolved = requestedPromotion ? resolveModel(ctx, cfg, picked.slot) : undefined;
+					const promote = resolved != null
+						&& slotIndex(cfg, resolved.slot) > slotIndex(cfg, state.slot);
+					const nextThinking = promote
+						? strongerThinking(state.thinking, picked.thinking)
+						: state.thinking;
+					const nextState: AutoState = {
+						...state,
+						adaptiveEvaluations: evaluations + 1,
+						adaptiveToolResults: toolResults,
+						verdict,
+					};
+					if (promote && resolved) {
+						nextState.slot = resolved.slot;
+						nextState.modelId = resolved.model.id;
+						nextState.thinking = nextThinking;
+						nextState.ruleId = `${picked.ruleId}+adaptive`;
+						lastExplain = [
+							`adaptive promotion after ${toolResults} tool results`,
+							formatVerdict(verdict, nextState.ruleId, resolved.slot, resolved.model.id, nextThinking),
+						].join("\n");
+						if (ctx.hasUI) {
+							ctx.ui.setStatus(
+								"ontoken-auto",
+								`adaptive ${state.modelId} → ${resolved.model.id} · ${nextThinking}`,
+							);
+						}
+						return {
+							model: resolved.model,
+							thinkingLevel: supportedThinking(resolved.model, nextThinking, cfg.maxThinking?.[resolved.slot]),
+							state: nextState,
+						};
+					}
+					return routeTo(request, ctx, cfg, state.slot, state.thinking, nextState);
+				}
+				return routeTo(request, ctx, cfg, state.slot, state.thinking, state);
+			}
 			if (request.reason !== "user" && request.state) {
-				return routeTo(
-					request,
-					ctx,
-					cfg,
-					request.state.slot,
-					request.state.thinking,
-					request.state,
-				);
+				return routeTo(request, ctx, cfg, request.state.slot, request.state.thinking, request.state);
 			}
 			if (!cfg.enabled && request.previous) {
 				return {
@@ -359,6 +589,8 @@ export default function (pi: ExtensionAPI) {
 				budget,
 				verdict,
 				ruleId: picked.ruleId,
+				adaptiveEvaluations: 0,
+				adaptiveToolResults: 0,
 			};
 			lastExplain = formatVerdict(verdict, picked.ruleId, resolved.slot, resolved.model.id, picked.thinking);
 			if (ctx.hasUI) {
