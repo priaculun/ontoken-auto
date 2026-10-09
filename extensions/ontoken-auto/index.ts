@@ -473,6 +473,36 @@ export default function (pi: ExtensionAPI) {
 		contextWindow: 1_000_000,
 		maxTokens: 128_000,
 		async route(request, ctx) {
+			try {
+				return await this.routeOnce(request, ctx);
+			} catch (err) {
+				// Same teardown race, but the runner was invalidated mid-route
+				// (e.g. during the awaited classify call). If the turn is being
+				// aborted anyway, fall back to the previous model instead of
+				// surfacing the stale-ctx error in the transcript.
+				if (request.signal?.aborted && request.previous) {
+					return {
+						model: request.previous.model,
+						thinkingLevel: request.previous.thinkingLevel ?? "low",
+						state: request.state,
+					};
+				}
+				throw err;
+			}
+		},
+		async routeOnce(request, ctx) {
+			// Session teardown race: pi can still ask a mid-turn loop for a
+			// continuation route after dispose() invalidated the extension runner
+			// (quit / newSession / fork / switchSession / reload). Any ctx access
+			// then throws the "extension ctx is stale" error into the transcript.
+			// Bail without touching ctx; pi discards the result anyway.
+			if (request.signal?.aborted && request.previous) {
+				return {
+					model: request.previous.model,
+					thinkingLevel: request.previous.thinkingLevel ?? "low",
+					state: request.state,
+				};
+			}
 			const cfg = loadConfig(ctx.cwd);
 			if (request.reason === "direct") {
 				return routeTo(request, ctx, cfg, cfg.directSlot, "low");
