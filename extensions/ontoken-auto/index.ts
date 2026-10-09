@@ -323,6 +323,39 @@ async function classify(
 	};
 }
 
+/**
+ * classify() that never throws. A Jev outage, a stale extension ctx
+ * (reload/teardown race), or a catalog hiccup degrades to the heuristic
+ * verdict — never kills the turn (which surfaces as the agent going idle
+ * with work left). The degradation is visible in /auto explain via
+ * verdict.error.
+ */
+async function classifySafe(
+	request: AutoRequest,
+	ctx: ExtensionContext,
+	cfg: AutoConfig,
+	promptOverride?: string,
+): Promise<Verdict> {
+	try {
+		return await classify(request, ctx, cfg, promptOverride);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : String(err);
+		const stale = /stale/i.test(message);
+		let prompt = "";
+		let hasImage = false;
+		try {
+			prompt = (promptOverride ?? contextualUserPrompt(request.messages, cfg)).slice(0, cfg.jev.promptChars);
+			hasImage = userHasImage(request.messages);
+		} catch {
+			// request.messages should always be readable; keep the empty defaults.
+		}
+		return {
+			...heuristic(prompt, hasImage),
+			error: stale ? "router ctx stale, heuristic fallback" : `classifier error, heuristic fallback: ${message.slice(0, 160)}`,
+		};
+	}
+}
+
 function ruleMatches(
 	rule: AutoConfig["rules"][number],
 	v: Verdict,
@@ -392,15 +425,26 @@ function routeTo(
 ): ModelRoute<AutoState> {
 	const resolved = resolveModel(ctx, cfg, slot);
 	const applied = supportedThinking(resolved.model, thinking, cfg.maxThinking?.[resolved.slot]);
+	const base = state ?? {
+		slot: resolved.slot,
+		modelId: resolved.model.id,
+		thinking: applied,
+		budget: cfg.budget,
+	};
+	// resolveModel can fall back to a different slot when the configured
+	// model is missing from the catalog — keep the persisted state truthful
+	// so the next continuation/failover reasons about the actual model.
+	if (base.slot !== resolved.slot || base.modelId !== resolved.model.id) {
+		return {
+			model: resolved.model,
+			thinkingLevel: applied,
+			state: { ...base, slot: resolved.slot, modelId: resolved.model.id, thinking: applied },
+		};
+	}
 	return {
 		model: resolved.model,
 		thinkingLevel: applied,
-		state: state ?? {
-			slot: resolved.slot,
-			modelId: resolved.model.id,
-			thinking: applied,
-			budget: cfg.budget,
-		},
+		state: base,
 	};
 }
 
@@ -476,11 +520,15 @@ export default function (pi: ExtensionAPI) {
 			try {
 				return await this.routeOnce(request, ctx);
 			} catch (err) {
-				// Same teardown race, but the runner was invalidated mid-route
-				// (e.g. during the awaited classify call). If the turn is being
-				// aborted anyway, fall back to the previous model instead of
-				// surfacing the stale-ctx error in the transcript.
-				if (request.signal?.aborted && request.previous) {
+				// The router must never kill a turn. A Jev outage, a stale
+				// extension ctx (reload / newSession / fork / switchSession /
+				// teardown race), or a catalog hiccup would otherwise end the
+				// turn abruptly — surfacing as the agent going idle with work
+				// left. Fall back to the in-flight model so the turn continues;
+				// the failure is recorded for /auto explain.
+				const message = err instanceof Error ? err.message : String(err);
+				lastExplain = `router error, kept in-flight model (${message.slice(0, 200)})`;
+				if (request.previous) {
 					return {
 						model: request.previous.model,
 						thinkingLevel: request.previous.thinkingLevel ?? "low",
@@ -533,6 +581,11 @@ export default function (pi: ExtensionAPI) {
 								"ontoken-auto",
 								`failover ${state.modelId} → ${target.model.id}`,
 							);
+							try {
+								ctx.ui.notify(`ontoken-auto failover: ${state.modelId} → ${target.model.id} (${request.failed.message?.errorMessage ?? "transient error"})`, "warning");
+							} catch {
+								// Stale ctx after teardown: the status update above is best-effort already.
+							}
 						}
 						return {
 							model: target.model,
@@ -557,7 +610,7 @@ export default function (pi: ExtensionAPI) {
 					evaluations < cfg.adaptive.maxEvaluationsPerTurn &&
 					enoughProgress
 				) {
-					const verdict = await classify(request, ctx, cfg, adaptiveProgressPrompt(request.messages, cfg));
+					const verdict = await classifySafe(request, ctx, cfg, adaptiveProgressPrompt(request.messages, cfg));
 					const picked = pickRoute(cfg, verdict, state.budget);
 					const requestedPromotion = verdict.source === "jev"
 						&& slotIndex(cfg, picked.slot) > slotIndex(cfg, state.slot);
@@ -609,7 +662,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 			const budget = cfg.budget;
-			const verdict = await classify(request, ctx, cfg);
+			const verdict = await classifySafe(request, ctx, cfg);
 			const picked = pickRoute(cfg, verdict, budget);
 			const resolved = resolveModel(ctx, cfg, picked.slot);
 			const state: AutoState = {
