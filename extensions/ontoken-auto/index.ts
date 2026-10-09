@@ -691,6 +691,46 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// ---------------------------------------------------------------- stall guard
+	// After a failover downgrade (or any model hiccup) a model sometimes ends its
+	// turn with a text-only intent announcement ("Tulis X sekarang", "I'll write Y")
+	// instead of the promised tool call — the run goes idle with work left.
+	// turn_end is an actionable boundary: return continue: true once to force
+	// exactly one context-only follow-up request so the model can act on its own
+	// plan. Guarded per assistant message and capped per run so it can never loop.
+	const nudgedEntries = new Set<string>();
+	let nudgesThisRun = 0;
+	pi.on("before_agent_start", () => {
+		nudgesThisRun = 0;
+	});
+	pi.on("turn_end", (event, ctx) => {
+		const message = event.message as { role?: string; stopReason?: string; content?: unknown } | undefined;
+		if (!message || message.role !== "assistant" || message.stopReason !== "stop") return undefined;
+		const content = Array.isArray(message.content) ? (message.content as Array<Record<string, unknown>>) : [];
+		if (content.some((block) => block?.type === "toolCall")) return undefined;
+		const text = content
+			.flatMap((block) => (block?.type === "text" && typeof block.text === "string" ? [block.text] : []))
+			.join("\n")
+			.trim();
+		// Only short intent announcements qualify; final summaries/questions do not.
+		if (!text || text.length > 300 || text.includes("?")) return undefined;
+		if (!/\b(sekarang|lanjut|selanjutnya|berikutnya|akan saya|saya akan|now|i'll|i will|next)\b/i.test(text)) {
+			return undefined;
+		}
+		if (nudgedEntries.has(event.messageEntryId) || nudgesThisRun >= 4) return undefined;
+		nudgedEntries.add(event.messageEntryId);
+		nudgesThisRun += 1;
+		lastExplain = `stall guard: text-only intent "${clippedTail(text, 80)}" without a tool call — one continuation forced`;
+		if (ctx.hasUI) {
+			try {
+				ctx.ui.notify("ontoken-auto: model announced work but made no tool call; continuing automatically.", "warning");
+			} catch {
+				// Stale ctx after teardown — the continuation still stands.
+			}
+		}
+		return { continue: true };
+	});
+
 	pi.registerCommand("auto", {
 		description: "OnToken auto-router: status, budget, explain, on/off",
 		handler: async (args, ctx) => {
