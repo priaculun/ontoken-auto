@@ -693,10 +693,10 @@ export default function (pi: ExtensionAPI) {
 
 	// ---------------------------------------------------------------- stall guard
 	// After a failover downgrade (or any model hiccup) a model sometimes ends its
-	// turn with a text-only intent announcement ("Tulis X sekarang", "I'll write Y")
-	// instead of the promised tool call — the run goes idle with work left.
-	// turn_end is an actionable boundary: return continue: true once to force
-	// exactly one context-only follow-up request so the model can act on its own
+	// turn with a text-only intent announcement ("Tulis X sekarang", "gas, saya
+	// bongkar datanya dulu") instead of the promised tool call — the run goes
+	// idle with work left. turn_end is an actionable boundary: queue one follow-up
+	// user message so the model gets a valid next request and can act on its own
 	// plan. Guarded per assistant message and capped per run so it can never loop.
 	const nudgedEntries = new Set<string>();
 	let nudgesThisRun = 0;
@@ -712,23 +712,53 @@ export default function (pi: ExtensionAPI) {
 			.flatMap((block) => (block?.type === "text" && typeof block.text === "string" ? [block.text] : []))
 			.join("\n")
 			.trim();
-		// Only short intent announcements qualify; final summaries/questions do not.
+		// Only short announcements qualify; final summaries/questions do not.
 		if (!text || text.length > 300 || text.includes("?")) return undefined;
-		if (!/\b(sekarang|lanjut|selanjutnya|berikutnya|akan saya|saya akan|now|i'll|i will|next)\b/i.test(text)) {
-			return undefined;
+		const finished = /(sudah selesai|udah (selesai|beres)|semua selesai|tuntas|beres[.!]?$|\bdone\b|selesai,?\s+silakan|silakan (cek|coba|dicoba)|ringkasan|kesimpulan)/i.test(text);
+		if (finished) return undefined;
+		// Mid-task signal: tool results already produced in this user turn.
+		let toolResultsSinceUser = 0;
+		try {
+			const branch = ctx.sessionManager.getBranch() as Array<{ type?: string; message?: { role?: string } }>;
+			for (let i = branch.length - 1; i >= 0; i--) {
+				const entry = branch[i];
+				if (!entry || entry.type !== "message" || !entry.message) continue;
+				if (entry.message.role === "user") break;
+				if (entry.message.role === "toolResult") toolResultsSinceUser += 1;
+			}
+		} catch {
+			// Branch unreadable (teardown) — treat as mid-task; the caps guard us.
+			toolResultsSinceUser = 1;
+		}
+		const strongIntent = /\b(sekarang|lanjut|selanjutnya|berikutnya|akan saya|saya akan|gas|gaskeun|yuk|ayo|mulai|eksekusi|now|i'll|i will|next)\b/i.test(text);
+		if (!strongIntent) {
+			// A vague short stop only counts as a stall mid-task, while really short.
+			if (text.length > 140 || toolResultsSinceUser === 0) return undefined;
 		}
 		if (nudgedEntries.has(event.messageEntryId) || nudgesThisRun >= 4) return undefined;
 		nudgedEntries.add(event.messageEntryId);
 		nudgesThisRun += 1;
-		lastExplain = `stall guard: text-only intent "${clippedTail(text, 80)}" without a tool call — one continuation forced`;
+		lastExplain = `stall guard: text-only intent "${clippedTail(text, 80)}" without a tool call — one follow-up queued`;
+		// Queue a follow-up instead of returning continue: pi rejects a bare
+		// continuation here (the boundary context ends in an assistant message,
+		// so there is no runnable model context). A queued user follow-up both
+		// satisfies canContinue and gives the model a valid next request.
+		try {
+			pi.sendUserMessage(
+				"Lanjutkan pekerjaanmu: eksekusi langkah berikutnya sekarang dengan memanggil tool yang diperlukan. Jangan hanya mengumumkan rencana.",
+				{ deliverAs: "followUp" },
+			);
+		} catch {
+			return undefined;
+		}
 		if (ctx.hasUI) {
 			try {
 				ctx.ui.notify("ontoken-auto: model announced work but made no tool call; continuing automatically.", "warning");
 			} catch {
-				// Stale ctx after teardown — the continuation still stands.
+				// Stale ctx after teardown — the follow-up still stands.
 			}
 		}
-		return { continue: true };
+		return undefined;
 	});
 
 	pi.registerCommand("auto", {
