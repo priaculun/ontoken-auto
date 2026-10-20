@@ -661,3 +661,13 @@ test("debug records never leak the API key", async () => {
 	const raw = readFileSync(logFile, "utf8");
 	assert.doesNotMatch(raw, /sk-verysecretvalue123456/);
 });
+
+test("disabled router never classifies even on the first turn of a session", async () => {
+	const harness = makeHarness({ overlay: { enabled: false } });
+	resetBuffers(harness);
+	// No `previous`: the first turn of a session. Old code classified anyway.
+	const route = await harness.route(request());
+	assert.equal(harness.classifyCalls, 0, "disabled router must not call the classifier");
+	assert.equal(route.state, undefined);
+	assert.equal(route.model.id, "gpt-6-luna");
+});

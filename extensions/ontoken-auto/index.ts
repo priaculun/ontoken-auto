@@ -682,17 +682,31 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// ------------------------------------------------------ disabled
-		if (!cfg.enabled && request.previous) {
+		// Routing off: never classify, never move the model. With no in-flight
+		// model (first turn of a session) fall back to the direct slot instead of
+		// classifying anyway, which would contradict `/auto status`.
+		if (!cfg.enabled) {
+			if (request.previous) {
+				dbg.record("route.disabled", {
+					modelId: request.previous.model.id,
+					thinking: request.thinkingLevel,
+				});
+				lastExplain = "router disabled (/auto on to enable) — kept in-flight model";
+				return {
+					model: request.previous.model,
+					thinkingLevel: request.thinkingLevel,
+					state: request.state,
+				};
+			}
+			const resolved = resolveModel(ctx, cfg, cfg.directSlot, dbg);
+			const thinking = resolveThinking(resolved.model, "low", cfg.maxThinking?.[resolved.slot]);
 			dbg.record("route.disabled", {
-				modelId: request.previous.model.id,
-				thinking: request.thinkingLevel,
+				slot: resolved.slot,
+				modelId: resolved.model.id,
+				thinking,
 			});
-			lastExplain = "router disabled (/auto on to enable) — kept in-flight model";
-			return {
-				model: request.previous.model,
-				thinkingLevel: request.thinkingLevel,
-				state: request.state,
-			};
+			lastExplain = "router disabled (/auto on to enable) — no in-flight model, used direct slot";
+			return { model: resolved.model, thinkingLevel: thinking };
 		}
 
 		// ----------------------------------------------------------- user
