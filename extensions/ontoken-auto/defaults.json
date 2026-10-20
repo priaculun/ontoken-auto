@@ -27,6 +27,7 @@
   },
   "directSlot": "fast",
   "fallbackSlot": "work",
+  "thinkingPolicy": "auto",
   "adaptive": {
     "contextAware": true,
     "shortPromptChars": 800,
@@ -35,7 +36,21 @@
     "toolResultsPerEvaluation": 2
   },
   "failover": {
-    "enabled": true
+    "enabled": true,
+    "notify": true
+  },
+  "debug": {
+    "enabled": false,
+    "level": "summary",
+    "file": null,
+    "bufferSize": 200,
+    "includePrompts": true
+  },
+  "stallGuard": {
+    "enabled": true,
+    "maxPerRun": 2,
+    "maxChars": 300,
+    "message": "Lanjutkan pekerjaanmu: eksekusi langkah berikutnya sekarang dengan memanggil tool yang diperlukan. Jangan hanya mengumumkan rencana."
   },
   "rules": [
     {
@@ -52,7 +67,7 @@
     },
     {
       "id": "involved-coding",
-      "when": { "taskIn": ["coding", "review", "research", "mechanical"], "maxDifficulty": 2 },
+      "when": { "taskIn": ["coding", "review", "research", "mechanical", "debug"], "minDifficulty": 2, "maxDifficulty": 2 },
       "slot": "work",
       "thinking": "high"
     },

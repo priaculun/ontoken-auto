@@ -1,7 +1,8 @@
-node_modules/
 .DS_Store
-*.log
 .env
 .env.*
 jev.md
+*.log
+node_modules
+node_modules/
 secrets/

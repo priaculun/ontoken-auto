@@ -1,15 +1,39 @@
 {
   "name": "ontoken-auto",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Pi virtual model ontoken/auto: TypeSafe Jev classifies each user prompt and routes OnToken model + thinking level.",
   "license": "MIT",
-  "keywords": ["pi-package", "pi-extension", "ontoken", "jev"],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-virtual-model",
+    "ontoken",
+    "jev",
+    "llm-router"
+  ],
   "type": "module",
+  "files": [
+    "extensions/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/",
+    "typecheck": "tsc -p tsconfig.json"
+  },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
   },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^1.3.0",
+    "@earendil-works/pi-coding-agent": "^1.3.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0"
+  },
   "pi": {
-    "extensions": ["./extensions/ontoken-auto/index.ts"]
+    "extensions": [
+      "./extensions/ontoken-auto/index.ts"
+    ]
   }
 }
