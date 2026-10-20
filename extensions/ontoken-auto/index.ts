@@ -394,37 +394,51 @@ export default function (pi: ExtensionAPI) {
 		type: "string",
 	});
 
-	const flagLevel = (() => {
+	const flagLevel = (): DebugLevel | undefined => {
+		// Pi populates flagValues only after every extension has finished
+		// loading, so this must be read lazily on each use, never at load time.
 		try {
-			const raw = String(pi.getFlag("ontoken-debug") ?? "").toLowerCase();
-			return ["off", "summary", "verbose"].includes(raw) ? (raw as DebugLevel) : undefined;
+			const raw = String(pi.getFlag("ontoken-debug") ?? "")
+				.trim()
+				.toLowerCase();
+			return (["off", "summary", "verbose"] as const).includes(raw as DebugLevel)
+				? (raw as DebugLevel)
+				: undefined;
 		} catch {
 			return undefined;
 		}
-	})();
+	};
 
 	const boot = safeLoadConfig(undefined);
-	if (flagLevel) {
-		boot.debug.enabled = flagLevel !== "off";
-		boot.debug.level = flagLevel;
-	}
 	ensureJevKey(boot);
-	debugFor(boot).record("boot", {
-		provider: boot.provider,
-		virtual: `${boot.virtual.provider}/${boot.virtual.id}`,
-		budget: boot.budget,
-		enabled: boot.enabled,
-		debugLevel: boot.debug.level,
-		slots: boot.slots,
-		jevKey: ensureJevKey(boot) ? "present" : "missing",
-	});
+
+	/**
+	 * Record the boot line on first session start rather than at load, so the
+	 * CLI flag and the final config are both readable.
+	 */
+	let bootLogged = false;
+	function logBoot(cfg: AutoConfig): void {
+		if (bootLogged) return;
+		bootLogged = true;
+		debugFor(cfg).record("boot", {
+			provider: cfg.provider,
+			virtual: `${cfg.virtual.provider}/${cfg.virtual.id}`,
+			budget: cfg.budget,
+			enabled: cfg.enabled,
+			debugLevel: cfg.debug.level,
+			debugSource: flagLevel() ? "flag" : cfg.debug.enabled ? "config" : "env",
+			slots: cfg.slots,
+			jevKey: ensureJevKey(cfg) ? "present" : "missing",
+		});
+	}
 
 	/** Effective config for a request/command, with the CLI flag applied. */
 	function configFor(cwd: string | undefined): AutoConfig {
 		const cfg = safeLoadConfig(cwd);
-		if (flagLevel) {
-			cfg.debug.enabled = flagLevel !== "off";
-			cfg.debug.level = flagLevel;
+		const level = flagLevel();
+		if (level) {
+			cfg.debug.enabled = level !== "off";
+			cfg.debug.level = level;
 		}
 		return cfg;
 	}
@@ -818,6 +832,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (event, ctx) => {
 		const cfg = configFor(ctx.cwd);
 		const dbg = debugFor(cfg);
+		// Flag values are populated before session_start, so this is the first
+		// point where the effective debug level is known.
+		logBoot(cfg);
 		dbg.record("session_start", {
 			reason: event.reason,
 			budget: cfg.budget,

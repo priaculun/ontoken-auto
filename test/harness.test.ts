@@ -671,3 +671,34 @@ test("disabled router never classifies even on the first turn of a session", asy
 	assert.equal(route.state, undefined);
 	assert.equal(route.model.id, "gpt-6-luna");
 });
+
+test("--ontoken-debug is read lazily, because Pi fills flag values after load", async () => {
+	// Pi calls extension factories first and only then assigns flagValues
+	// (agent-session-services: applyExtensionFlagValues runs after load). Reading
+	// the flag at load time therefore always returned undefined.
+	const harness = makeHarness();
+	resetBuffers(harness);
+	// Simulate the value arriving after registration, as Pi does.
+	harness.flags["ontoken-debug"] = "verbose";
+
+	const cwd = mkdtempSync(join(tmpdir(), "ontoken-cwd-"));
+	const logFile = join(mkdtempSync(join(tmpdir(), "ontoken-log-")), "flag.jsonl");
+	const ctx = fakeCtx(cwd);
+	const auto = harness.command("auto")!;
+	await auto(`debug file ${logFile}`, ctx);
+	await harness.emit("session_start", { reason: "startup" }, ctx);
+
+	const { readFileSync } = await import("node:fs");
+	const kinds = readFileSync(logFile, "utf8")
+		.trim()
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => JSON.parse(line).kind);
+	assert.ok(kinds.includes("boot"), `expected a boot record, got ${kinds.join(",")}`);
+	assert.ok(kinds.includes("session_start"));
+});
+
+test("flag registration happens at load so Pi can parse the CLI option", async () => {
+	const harness = makeHarness();
+	assert.ok("ontoken-debug" in harness.flags, "flag must be registered during load");
+});
