@@ -53,8 +53,10 @@ import {
 	formatVerdict,
 	heuristic,
 	isFailoverWorthy,
+	isSyntheticUserMessage,
 	pickRoute,
 	redactClassifierText,
+	registerSyntheticUserText,
 	resolveThinking,
 	strongerThinking,
 	supportedThinkingLevels,
@@ -62,6 +64,9 @@ import {
 } from "./router.ts";
 
 type AutoRequest = ModelRouteRequest<RouteState>;
+
+/** customType of the stall-guard follow-up (routed as a continuation, not a user turn). */
+const STALL_MESSAGE_TYPE = "ontoken-auto-stall";
 
 /** Last routing decision, rendered by `/auto explain`. */
 let lastExplain = "no routing yet this process";
@@ -435,6 +440,9 @@ export default function (pi: ExtensionAPI) {
 	/** Effective config for a request/command, with the CLI flag applied. */
 	function configFor(cwd: string | undefined): AutoConfig {
 		const cfg = safeLoadConfig(cwd);
+		// The stall follow-up reaches the router as a user-role message; never
+		// classify it as the task (it would always look like a tiny chat turn).
+		registerSyntheticUserText(cfg.stallGuard.message);
 		const level = flagLevel();
 		if (level) {
 			cfg.debug.enabled = level !== "off";
@@ -724,6 +732,16 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// ----------------------------------------------------------- user
+		// A "user" turn whose newest user message is a synthetic nudge (e.g.
+		// `/self-compact-now`, or a stall follow-up from an older config) is not
+		// a new task: keep the in-flight model so the prompt cache survives.
+		if (request.state) {
+			const lastUser = [...request.messages].reverse().find((m) => m.role === "user") as MessageLike | undefined;
+			if (isSyntheticUserMessage(lastUser)) {
+				dbg.record("route.synthetic", { slot: request.state.slot, modelId: request.state.modelId });
+				return routeTo(ctx, cfg, dbg, request.state.slot, request.state.thinking, request.state);
+			}
+		}
 		const budget = cfg.budget;
 		const verdict = await classifySafe(request, ctx, cfg, dbg);
 		const picked = pickRoute(cfg, verdict, budget);
@@ -817,10 +835,15 @@ export default function (pi: ExtensionAPI) {
 		});
 		// Queue a follow-up instead of returning continue: pi rejects a bare
 		// continuation here (the boundary context ends in an assistant message,
-		// so there is no runnable model context). A queued user follow-up both
-		// satisfies canContinue and gives the model a valid next request.
+		// so there is no runnable model context). A custom (not user) message
+		// gives the model a valid next request while Pi routes it as a
+		// `continuation`: the in-flight model and its prompt cache are kept
+		// instead of a fresh classification that could switch models.
 		try {
-			pi.sendUserMessage(cfg.stallGuard.message, { deliverAs: "followUp" });
+			pi.sendMessage(
+				{ customType: STALL_MESSAGE_TYPE, content: cfg.stallGuard.message, display: false },
+				{ triggerTurn: true, deliverAs: "followUp" },
+			);
 		} catch {
 			return undefined;
 		}

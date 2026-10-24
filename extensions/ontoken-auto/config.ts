@@ -396,7 +396,7 @@ function normalizeConfig(raw: Record<string, unknown>): AutoConfig {
 	const jev = asRecord(raw.jev) ?? {};
 	const provider = typeof raw.provider === "string" && raw.provider.trim() ? raw.provider.trim() : "ontoken";
 	const slots = normalizeSlots(raw.slots, {
-		fast: "gpt-6-luna",
+		fast: "glm-5.3-flash",
 		work: "glm-5.3-flash",
 		solid: "muse-spark-1.3",
 		strong: "claude-sonnet-5.5",

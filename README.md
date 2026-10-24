@@ -154,8 +154,9 @@ can also cap its level with `maxThinking`.
 
 When a dispatched model fails with a transient error (5xx, 429/rate limit,
 overloaded, timeout, network), the next retry moves the turn to another slot
-instead of re-hitting the broken model. Auth, quota, billing errors, and user
-aborts are **not** failed over. Failover respects the budget ceiling and never
+instead of re-hitting the broken model. Auth, quota, billing errors, user
+aborts, and **context overflow** are **not** failed over (Pi compacts and
+retries; the same slot keeps its prompt cache). Failover respects the budget ceiling and never
 returns to a slot that already failed this turn. Routing state records the
 switch (`ruleId` gains `+failover`), and `/auto explain` shows the last
 failover decision.
@@ -183,6 +184,8 @@ shape — a short, tool-call-free, non-final assistant message whose **final
 sentence** is a promise to act — and queues one follow-up telling the model to
 execute. It is capped per run and deliberately conservative: lists of results,
 completion summaries, questions, and multi-sentence prose never trigger it.
+The follow-up is a hidden custom message, so Pi routes it as a `continuation`:
+the in-flight model and its prompt cache are kept (no reclassification).
 
 ```json
 {
@@ -194,6 +197,19 @@ completion summaries, questions, and multi-sentence prose never trigger it.
   }
 }
 ```
+
+## With self-compact
+
+Works alongside [self-compact](https://github.com/priaculun/self-compact):
+
+- Its handoff/resume and idle nudges are custom messages → routed as
+  `continuation`; the model and cache survive compaction.
+- Router input skips its synthetic user texts ("Compact now: …", "Continue from
+  your saved note_to_self …") and the stall follow-up, so classification and
+  mid-turn tool counts always refer to the real task. A `user` turn that is only
+  such a nudge (e.g. `/self-compact-now`) keeps the in-flight model.
+- Compaction summaries are `direct` requests → `directSlot` (`fast`).
+- Context overflow retries on the same slot (see Failover).
 
 ## Change roster / rules without editing code
 
@@ -247,7 +263,7 @@ rule wins ties):
 
 | Slot | Model | Role |
 |---|---|---|
-| fast | `gpt-6-luna` | chat / lookup, thinking off |
+| fast | `glm-5.3-flash` | chat / lookup, compaction summaries (`directSlot`); cheapest live model, 2–4 s |
 | work | `glm-5.3-flash` | routine–involved coding |
 | solid | `muse-spark-1.3` | hard debug / design |
 | strong | `claude-sonnet-5.5` | frontier |

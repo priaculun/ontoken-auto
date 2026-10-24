@@ -65,6 +65,8 @@ interface FakeHarness {
 	command(name: string): ((args: string, ctx: unknown) => Promise<void>) | undefined;
 	emit(event: string, payload: unknown, ctx: unknown): Promise<unknown>;
 	sent: string[];
+	/** Custom messages queued through pi.sendMessage. */
+	sentCustom: Array<{ customType: string; triggerTurn?: boolean }>;
 	statuses: Array<[string, string | undefined]>;
 	notifications: Array<[string, string]>;
 	classifyCalls: number;
@@ -88,6 +90,7 @@ function makeHarness(opts: { cwd?: string; overlay?: Record<string, unknown> } =
 	const commands = new Map<string, (args: string, ctx: unknown) => Promise<void>>();
 	const flags: Record<string, string> = {};
 	const sent: string[] = [];
+	const sentCustom: Array<{ customType: string; triggerTurn?: boolean }> = [];
 	const statuses: Array<[string, string | undefined]> = [];
 	const notifications: Array<[string, string]> = [];
 
@@ -102,6 +105,7 @@ function makeHarness(opts: { cwd?: string; overlay?: Record<string, unknown> } =
 			return result;
 		},
 		sent,
+		sentCustom,
 		statuses,
 		notifications,
 		classifyCalls: 0,
@@ -171,6 +175,10 @@ function makeHarness(opts: { cwd?: string; overlay?: Record<string, unknown> } =
 		},
 		sendUserMessage(content: string) {
 			sent.push(content);
+		},
+		sendMessage(message: { customType: string; content: string }, options?: { triggerTurn?: boolean }) {
+			sentCustom.push({ customType: message.customType, triggerTurn: options?.triggerTurn });
+			sent.push(message.content);
 		},
 		events: { emit() {}, on() {} },
 	} as unknown as Parameters<typeof register>[0];
@@ -245,8 +253,10 @@ test("user route: Jev verdict picks slot, model, thinking and persists state", a
 
 	const route = await harness.route(request({ messages: [userMsg("halo, apa kabar?")] }));
 
-	assert.equal(route.model.id, "gpt-6-luna");
-	assert.equal(route.thinkingLevel, "off");
+	// fast = glm-5.3-flash, which cannot turn reasoning off: "off" clamps to the
+	// nearest supported level (the fake map keeps "minimal"; the real one "low").
+	assert.equal(route.model.id, "glm-5.3-flash");
+	assert.equal(route.thinkingLevel, "minimal");
 	assert.equal(route.state?.slot, "fast");
 	assert.equal(route.state?.ruleId, "chat-trivial");
 	assert.equal(route.state?.budget, "balanced");
@@ -467,7 +477,7 @@ test("direct requests (compaction) use directSlot and never classify", async () 
 	const cwd = mkdtempSync(join(tmpdir(), "ontoken-cwd-"));
 	resetBuffers(harness);
 	const route = await harness.route(request({ reason: "direct", messages: [] }));
-	assert.equal(route.model.id, "gpt-6-luna");
+	assert.equal(route.model.id, "glm-5.3-flash");
 	assert.equal(route.thinkingLevel, "low");
 	assert.equal(route.state, undefined);
 	assert.equal(harness.classifyCalls, 0);
@@ -529,6 +539,8 @@ test("stall guard queues one follow-up for a text-only announcement", async () =
 	assert.equal(result, undefined);
 	assert.equal(harness.sent.length, 1);
 	assert.match(harness.sent[0], /eksekusi langkah berikutnya/);
+	// Sent as a custom message so Pi routes it as a continuation (model and cache kept).
+	assert.deepEqual(harness.sentCustom, [{ customType: "ontoken-auto-stall", triggerTurn: true }]);
 	// Same entry never nudges twice.
 	await harness.emit("turn_end", { message, messageEntryId: "entry-1", toolResults: [] }, ctx);
 	assert.equal(harness.sent.length, 1);
@@ -600,7 +612,7 @@ test("/auto status, explain and check render without throwing", async () => {
 	const joined = harness.notifications.map(([m]) => m).join("\n");
 	assert.match(joined, /enabled/);
 	assert.match(joined, /classifier typesafe\/jev-latest: found/);
-	assert.match(joined, /gpt-6-luna — ok/);
+	assert.match(joined, /glm-5.3-flash — ok/);
 });
 
 test("/auto debug toggles the log and /auto log prints records", async () => {
@@ -669,7 +681,7 @@ test("disabled router never classifies even on the first turn of a session", asy
 	const route = await harness.route(request());
 	assert.equal(harness.classifyCalls, 0, "disabled router must not call the classifier");
 	assert.equal(route.state, undefined);
-	assert.equal(route.model.id, "gpt-6-luna");
+	assert.equal(route.model.id, "glm-5.3-flash");
 });
 
 test("--ontoken-debug is read lazily, because Pi fills flag values after load", async () => {
@@ -701,4 +713,75 @@ test("--ontoken-debug is read lazily, because Pi fills flag values after load", 
 test("flag registration happens at load so Pi can parse the CLI option", async () => {
 	const harness = makeHarness();
 	assert.ok("ontoken-debug" in harness.flags, "flag must be registered during load");
+});
+
+// ------------------------------------------------- interplay with self-compact
+
+test("retry after a context overflow stays on the same slot (no failover)", async () => {
+	const harness = makeHarness();
+	harness.classifyAnswer = jevAnswers("coding", 1);
+	resetBuffers(harness);
+	const first = await harness.route(request({ messages: [userMsg("go")] }));
+	const retry = await harness.route(
+		request({
+			reason: "retry",
+			state: first.state!,
+			failed: {
+				model: MODELS[first.model.id] as never,
+				thinkingLevel: "low",
+				message: {
+					role: "assistant",
+					content: [],
+					stopReason: "error",
+					errorMessage: "400 This model's maximum context length is 131072 tokens",
+				} as never,
+			},
+		}),
+	);
+	assert.equal(retry.model.id, first.model.id);
+	assert.equal(retry.state?.slot, first.state?.slot);
+	assert.notEqual(retry.state?.failedOver, true);
+});
+
+test("a user turn that is only a self-compact nudge keeps the in-flight model", async () => {
+	const harness = makeHarness();
+	harness.classifyAnswer = jevAnswers("debug", 3, true);
+	resetBuffers(harness);
+	const first = await harness.route(request({ messages: [userMsg("debug the deadlock in the scheduler")] }));
+	harness.classifyCalls = 0;
+	harness.classifyAnswer = jevAnswers("chat", 0);
+	const nudge = await harness.route(
+		request({
+			reason: "user",
+			state: first.state!,
+			messages: [
+				userMsg("debug the deadlock in the scheduler"),
+				{ role: "assistant", content: [{ type: "text", text: "..." }] } as never,
+				userMsg("Compact now: write your note_to_self (max 12000 chars) and call self_compact as your only tool call."),
+			],
+		}),
+	);
+	assert.equal(harness.classifyCalls, 0, "nudges must not be classified");
+	assert.equal(nudge.model.id, first.model.id);
+	assert.equal(nudge.state?.slot, first.state?.slot);
+});
+
+test("mid-turn adaptive evaluation ignores a self-compact resume message", async () => {
+	const harness = makeHarness();
+	harness.classifyAnswer = jevAnswers("coding", 1);
+	resetBuffers(harness);
+	const first = await harness.route(request({ messages: [userMsg("implement x")] }));
+	harness.classifyCalls = 0;
+	const tool = { role: "toolResult", toolName: "read", content: [] };
+	// Two tool results before the resume nudge, one after: three since the real task.
+	const messages = [
+		userMsg("implement x"),
+		tool,
+		tool,
+		userMsg("Continue from your saved note_to_self above (self-compact cycle 1). Perform only its unfinished NEXT ACTION."),
+		tool,
+	];
+	const next = await harness.route(request({ reason: "continuation", state: first.state!, messages: messages as never }));
+	assert.equal(harness.classifyCalls, 1, "progress since the real task triggers one evaluation");
+	assert.equal(next.state?.adaptiveToolResults, 3);
 });

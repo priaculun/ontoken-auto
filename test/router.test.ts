@@ -26,8 +26,12 @@ import {
 	detectStall,
 	failoverTarget,
 	heuristic,
+	isContextOverflowError,
 	isFailoverWorthy,
+	isSyntheticUserMessage,
+	lastUserText,
 	pickRoute,
+	registerSyntheticUserText,
 	redactClassifierText,
 	resolveThinking,
 	supportedThinkingLevels,
@@ -522,4 +526,56 @@ test("detectStall still catches a short promise as the final sentence", () => {
 		{ toolResultsSinceUser: 2, maxChars: 300 },
 	);
 	assert.equal(decision.stall, true);
+});
+
+// ------------------------------------------------- interplay with self-compact
+
+test("context overflow is not failover-worthy (compaction fixes it, not another model)", () => {
+	const overflow = [
+		"400 This model's maximum context length is 131072 tokens",
+		"prompt is too long: 1048577 tokens > 1048576 maximum",
+		"Your input exceeds the context window of this model",
+		"context_length_exceeded",
+		"413 Request Entity Too Large",
+	];
+	for (const errorMessage of overflow) {
+		assert.equal(isContextOverflowError(errorMessage), true, errorMessage);
+		assert.equal(isFailoverWorthy({ message: { stopReason: "error", errorMessage } }), false, errorMessage);
+	}
+	// Throttling that mentions tokens is still transient.
+	assert.equal(isContextOverflowError("429 Too many requests: too many tokens per minute"), false);
+	assert.equal(isFailoverWorthy({ message: { stopReason: "error", errorMessage: "429 rate limit, too many tokens" } }), true);
+	assert.equal(isFailoverWorthy({ message: { stopReason: "error", errorMessage: "503 UPSTREAM_UNAVAILABLE" } }), true);
+});
+
+const COMPACT_NOW = "Compact now: write your note_to_self (max 12000 chars: goal, ...) and call self_compact as your only tool call.";
+const RESUME = "Continue from your saved note_to_self above (self-compact cycle 2). Perform only its unfinished NEXT ACTION.";
+
+test("self-compact nudges are not treated as the user's task", () => {
+	assert.equal(isSyntheticUserMessage(userText(COMPACT_NOW)), true);
+	assert.equal(isSyntheticUserMessage(userText(RESUME)), true);
+	assert.equal(isSyntheticUserMessage(userText("fix the flaky login test")), false);
+	assert.equal(isSyntheticUserMessage(assistantText(COMPACT_NOW)), false);
+
+	const messages = [userText("fix the flaky login test"), toolResult("read", "a"), userText(COMPACT_NOW), toolResult("bash", "b")];
+	assert.equal(lastUserText(messages), "fix the flaky login test");
+	assert.equal(currentTurnToolResults(messages), 2);
+	const prompt = adaptiveProgressPrompt(messages, isolatedConfig());
+	assert.match(prompt, /fix the flaky login test/);
+	assert.doesNotMatch(prompt, /Compact now/);
+	assert.doesNotMatch(contextualUserPrompt([userText("lanjut"), userText(RESUME)], isolatedConfig()), /saved note_to_self/);
+});
+
+test("registered stall text is synthetic too", () => {
+	const text = "Kerjakan langkah berikutnya sekarang (custom stall text).";
+	assert.equal(isSyntheticUserMessage(userText(text)), false);
+	registerSyntheticUserText(text);
+	assert.equal(isSyntheticUserMessage(userText(text)), true);
+	assert.equal(lastUserText([userText("deploy the service"), userText(text)]), "deploy the service");
+});
+
+test("a self-compact handoff note (the real goal) still counts as the objective", () => {
+	const note = "GOAL: migrate the billing table. NEXT ACTION: run the migration.";
+	assert.equal(isSyntheticUserMessage(userText(note)), false);
+	assert.equal(lastUserText([userText("old"), userText(note)]), note);
 });

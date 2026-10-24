@@ -67,8 +67,46 @@ export interface RouteState {
 
 // ------------------------------------------------------------------- text utils
 
+/**
+ * User-role messages that are not a task: nudges that extensions inject into
+ * the conversation (Pi converts custom messages to role "user" before routing).
+ * Treating them as the objective would make the classifier route on
+ * "Compact now…" or "Lanjutkan pekerjaanmu…" instead of the real task.
+ * Compaction summaries and self-compact handoff notes are NOT listed: they
+ * carry the goal after the original request was compacted away.
+ */
+const SYNTHETIC_USER_RE: readonly RegExp[] = [
+	/^Compact now: write your note_to_self\b/, // self-compact idle/forced nudge
+	/^Continue from your saved note_to_self above\b/, // self-compact crash resume
+];
+
+/** Exact texts registered at runtime, e.g. the configured stall-guard follow-up. */
+const syntheticUserTexts = new Set<string>();
+
+export function registerSyntheticUserText(text: string): void {
+	const t = text.trim();
+	if (t) syntheticUserTexts.add(t);
+}
+
+export function isSyntheticUserMessage(message: MessageLike | undefined): boolean {
+	if (!message || message.role !== "user") return false;
+	const text = contentText(message.content).trim();
+	if (!text) return false;
+	return syntheticUserTexts.has(text) || SYNTHETIC_USER_RE.some((re) => re.test(text));
+}
+
+/** Index of the latest real user message (synthetic nudges skipped), or -1. */
+export function lastObjectiveIndex(messages: readonly MessageLike[]): number {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const m = messages[i];
+		if (m?.role === "user" && !isSyntheticUserMessage(m)) return i;
+	}
+	return -1;
+}
+
 export function lastUserText(messages: readonly MessageLike[]): string {
-	const content = messages.filter((m) => m.role === "user").at(-1)?.content ?? "";
+	const idx = lastObjectiveIndex(messages);
+	const content = (idx >= 0 ? messages[idx]?.content : undefined) ?? "";
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	return content
@@ -81,7 +119,7 @@ export function lastUserText(messages: readonly MessageLike[]): string {
 }
 
 export function userHasImage(messages: readonly MessageLike[]): boolean {
-	const last = messages.filter((m) => m.role === "user").at(-1);
+	const last = messages[lastObjectiveIndex(messages)];
 	if (!last || !Array.isArray(last.content)) return false;
 	return last.content.some((block) => {
 		if (!block || typeof block !== "object") return false;
@@ -133,7 +171,11 @@ export function contextualUserPrompt(messages: readonly MessageLike[], cfg: Auto
 	if (!cfg.adaptive.contextAware || latest.length > cfg.adaptive.shortPromptChars) {
 		return latest.slice(0, cfg.jev.promptChars);
 	}
-	const prior = messages.filter((m) => m.role === "user" || m.role === "assistant").slice(0, -1);
+	// Context before the objective; synthetic nudges carry no task information.
+	const objective = lastObjectiveIndex(messages);
+	const prior = messages
+		.slice(0, Math.max(0, objective))
+		.filter((m) => (m.role === "user" && !isSyntheticUserMessage(m)) || m.role === "assistant");
 	const sections: string[] = [`CURRENT USER REQUEST:\n${latest}`];
 	let remaining = Math.max(0, cfg.jev.promptChars - sections[0].length - 2);
 	for (let i = prior.length - 1; i >= 0 && remaining > 80; i--) {
@@ -148,15 +190,15 @@ export function contextualUserPrompt(messages: readonly MessageLike[], cfg: Auto
 	return sections.join("\n\n").slice(-cfg.jev.promptChars);
 }
 
-/** Number of tool results produced since the latest user message. */
+/** Number of tool results produced since the latest real user message. */
 export function currentTurnToolResults(messages: readonly MessageLike[]): number {
-	const lastUser = messages.findLastIndex((m) => m.role === "user");
+	const lastUser = lastObjectiveIndex(messages);
 	return messages.slice(lastUser + 1).filter((m) => m.role === "toolResult").length;
 }
 
 /** Classification input used after tool progress within the current turn. */
 export function adaptiveProgressPrompt(messages: readonly MessageLike[], cfg: AutoConfig): string {
-	const lastUser = messages.findLastIndex((m) => m.role === "user");
+	const lastUser = lastObjectiveIndex(messages);
 	const before = messages.slice(0, lastUser + 1);
 	const progress = messages.slice(lastUser + 1);
 	const maxChars = Math.max(1000, cfg.jev.promptChars);
@@ -347,12 +389,30 @@ export function isFailoverWorthy(failed: FailedRequest): boolean {
 	if (/\b(401|403|invalid api key|authentication|unauthorized|api key|quota|billing|payment|credit)\b/.test(err)) {
 		return false;
 	}
+	// Context overflow is fixed by compaction, not by another model: Pi compacts
+	// and retries. Switching slots here would only drop the prompt cache (and
+	// usually land on a pricier model) for a request that now fits anyway.
+	if (isContextOverflowError(err)) return false;
 	// 5xx, 429, overloaded, timeout, network errors — the transient family.
 	return (
 		/\b(429|5[0-9][0-9]|overloaded|rate limit|too many requests|timeout|timed out|econn|enotfound|econnreset|econnrefused|etimedout|socket|network|temporarily|unavailable|bad gateway|service unavailable|internal server error)\b/.test(
 			err,
 		) || stop === "error"
 	);
+}
+
+/**
+ * Mirror of pi-ai's OVERFLOW_PATTERNS (utils/overflow.ts), kept local because
+ * this module must not import Pi at runtime. Rate-limit texts are excluded the
+ * same way Pi does ("Too many tokens, please wait" is throttling).
+ */
+const OVERFLOW_RE =
+	/prompt (?:is )?too long|prompt exceeds max length|request_too_large|input is too long|exceeds the context window|maximum context length|exceeds (?:the )?maximum allowed input length|context length|context window exceeds|exceeded model token limit|maximum prompt length|reduce the length of the messages|input token count.*exceeds|exceeds the (?:limit|available context)|context[_ ]length[_ ]exceeded|model_context_window_exceeded|range of input length|too many tokens|token limit exceeded|^(?:[\w -]+ api error \(413\):|413(?:\s|:|$))/i;
+const NON_OVERFLOW_RE = /^(throttling error|service unavailable):|rate limit|too many requests/i;
+
+export function isContextOverflowError(errorMessage: string): boolean {
+	if (!errorMessage || NON_OVERFLOW_RE.test(errorMessage)) return false;
+	return OVERFLOW_RE.test(errorMessage);
 }
 
 export interface FailoverTarget {
