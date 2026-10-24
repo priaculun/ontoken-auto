@@ -258,7 +258,7 @@ Prices: OnToken catalog `priceOnt*` (1 ONT = Rp1.000). Intelligence: Artificial 
 ## Development
 
 ```bash
-node --test test/        # 57 tests, no network, no Pi runtime needed
+npm test                 # 60 tests, no network, no Pi runtime needed
 npx tsc -p tsconfig.json # typecheck (no emit)
 ```
 
