@@ -785,3 +785,56 @@ test("mid-turn adaptive evaluation ignores a self-compact resume message", async
 	assert.equal(harness.classifyCalls, 1, "progress since the real task triggers one evaluation");
 	assert.equal(next.state?.adaptiveToolResults, 3);
 });
+
+// ------------------------------------------------- subagent (shared runtime)
+
+/** Make every ctx getter throw, like Pi's runner after dispose(). */
+function makeStale(ctx: Record<string, unknown>): void {
+	for (const key of ["cwd", "hasUI", "ui", "modelRegistry", "sessionManager", "mode"]) {
+		Object.defineProperty(ctx, key, {
+			get() {
+				throw new Error("This extension ctx is stale after session replacement or reload.");
+			},
+		});
+	}
+}
+
+test("router survives a disposed subagent that re-registered the virtual model", async () => {
+	// Parent session loads the extension and starts.
+	const parent = makeHarness();
+	await parent.emit("session_start", { reason: "startup" }, parent.ctx);
+	// A subagent loads it again; its registration replaces the parent's route
+	// on the shared ModelRuntime, bound to the child's ctx.
+	const child = makeHarness();
+	await child.emit("session_start", { reason: "startup" }, child.ctx);
+	// Child is disposed (with or without session_shutdown) — its ctx goes stale.
+	makeStale(child.ctx);
+	// Without a previous route the old code threw the stale-ctx error here.
+	const route = await child.route(request({ reason: "direct", messages: [] }));
+	assert.equal(route.model.id, "glm-5.3-flash");
+	assert.equal(route.thinkingLevel, "low");
+});
+
+test("a subagent's run start does not reset the parent's stall budget", async () => {
+	const parent = makeHarness({ overlay: { stallGuard: { maxPerRun: 1 } } });
+	const cwd = mkdtempSync(join(tmpdir(), "ontoken-cwd-"));
+	resetBuffers(parent);
+	const ctx = fakeCtx(cwd, [
+		{ type: "message", message: { role: "user" } },
+		{ type: "message", message: { role: "toolResult" } },
+	]);
+	await parent.emit("before_agent_start", { messageType: "user" }, ctx);
+	const announce = (entry: string) => ({
+		message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Gas, saya mulai." }] },
+		messageEntryId: entry,
+		toolResults: [],
+	});
+	await parent.emit("turn_end", announce("p1"), ctx);
+	// A subagent starts and ends a run in the same process.
+	const child = makeHarness({ overlay: { stallGuard: { maxPerRun: 1 } } });
+	await child.emit("before_agent_start", { messageType: "user" }, ctx);
+	await child.emit("session_shutdown", { reason: "quit" }, ctx);
+	// Parent is still capped: the child must not have reset its counter.
+	await parent.emit("turn_end", announce("p2"), ctx);
+	assert.equal(parent.sent.length, 1);
+});

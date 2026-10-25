@@ -73,10 +73,35 @@ let lastExplain = "no routing yet this process";
 /** Debug log, rebuilt whenever the effective debug config changes. */
 let debugLog: DebugLog | undefined;
 let debugKey = "";
-/** Follow-ups queued by the stall guard in the current run. */
-let nudgesThisRun = 0;
-/** Assistant entries already nudged, so one message can never nudge twice. */
-const nudgedEntries = new Set<string>();
+/**
+ * Contexts of sessions that loaded this extension and are still live, newest
+ * last. Pi caches this module, so a subagent that loads the extension runs the
+ * factory again in the same process and re-registers the virtual model on the
+ * shared ModelRuntime — its route closure is bound to the child's runner. Once
+ * that child is disposed, the ctx Pi hands to route() is stale. route() then
+ * falls back to the newest live context here (normally the parent session).
+ */
+const liveContexts: ExtensionContext[] = [];
+
+function isStaleContext(ctx: ExtensionContext): boolean {
+	try {
+		void ctx.cwd;
+		return false;
+	} catch {
+		return true;
+	}
+}
+
+/** The given ctx when usable, else the newest live session context. */
+function usableContext(ctx: ExtensionContext): ExtensionContext {
+	if (!isStaleContext(ctx)) return ctx;
+	for (let i = liveContexts.length - 1; i >= 0; i--) {
+		const candidate = liveContexts[i]!;
+		if (!isStaleContext(candidate)) return candidate;
+		liveContexts.splice(i, 1); // prune sessions disposed without session_shutdown
+	}
+	return ctx;
+}
 
 function debugFor(cfg: AutoConfig): DebugLog {
 	const key = JSON.stringify(cfg.debug);
@@ -393,6 +418,15 @@ function notify(ctx: ExtensionContext, message: string, type: "info" | "warning"
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	// Stall-guard state is per instance (= per session). It used to be module
+	// level, so a subagent's run start/shutdown reset the parent's counters.
+	/** Follow-ups queued by the stall guard in the current run. */
+	let nudgesThisRun = 0;
+	/** Assistant entries already nudged, so one message can never nudge twice. */
+	const nudgedEntries = new Set<string>();
+	/** This session's context, registered in liveContexts while it is live. */
+	let ownContext: ExtensionContext | undefined;
+
 	// CLI flag: --ontoken-debug <off|summary|verbose>
 	pi.registerFlag("ontoken-debug", {
 		description: "OnToken auto-router debug level: off | summary | verbose",
@@ -458,8 +492,9 @@ export default function (pi: ExtensionAPI) {
 		thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
 		contextWindow: 1_000_000,
 		maxTokens: 128_000,
-		async route(request, ctx) {
+		async route(request, routeCtx) {
 			const startedAt = Date.now();
+			const ctx = usableContext(routeCtx);
 			let cfg: AutoConfig;
 			try {
 				cfg = configFor(ctx.cwd);
@@ -858,6 +893,11 @@ export default function (pi: ExtensionAPI) {
 		// Flag values are populated before session_start, so this is the first
 		// point where the effective debug level is known.
 		logBoot(cfg);
+		// A session reload fires session_start again: replace, never duplicate.
+		const previous = ownContext ? liveContexts.indexOf(ownContext) : -1;
+		if (previous >= 0) liveContexts.splice(previous, 1);
+		ownContext = ctx;
+		liveContexts.push(ctx);
 		dbg.record("session_start", {
 			reason: event.reason,
 			budget: cfg.budget,
@@ -874,6 +914,11 @@ export default function (pi: ExtensionAPI) {
 		// Clear the footer slot so a stale status never survives a session.
 		nudgesThisRun = 0;
 		nudgedEntries.clear();
+		if (ownContext) {
+			const at = liveContexts.indexOf(ownContext);
+			if (at >= 0) liveContexts.splice(at, 1);
+			ownContext = undefined;
+		}
 	});
 
 	// ------------------------------------------------------------------ /auto

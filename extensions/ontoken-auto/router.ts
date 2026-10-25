@@ -476,6 +476,9 @@ const FINISHED_RE =
 const INTENT_RE =
 	/\b(sekarang|lanjut|selanjutnya|berikutnya|akan saya|saya akan|saya (tulis|buat|ubah|hapus|jalankan|buka|baca)|gas|gaskeun|yuk|ayo|mulai|eksekusi|now|i'll|i will|let me|next i)\b/i;
 const BULLET_RE = /^\s*(?:[-*•‣]|\d+[.)])\s+/;
+/** A fragment opening with a progressive action verb narrates work it never started. */
+const ACTION_START_RE =
+	/^(?:membaca|menulis|mengecek|memeriksa|menjalankan|membuka|mengubah|membuat|mencari|reading|writing|checking|running|opening|editing|searching|looking)\b/i;
 
 /** A list-heavy message is a result, not a promise to act. */
 function looksLikeList(text: string): boolean {
@@ -533,10 +536,18 @@ export function detectStall(
 	const tail = finalSentence(text);
 	const tailHasIntent = INTENT_RE.test(tail);
 	if (!tailHasIntent) {
-		// A vague short stop only counts as a stall mid-task, while really short,
-		// and only when it is one fragment rather than multi-sentence prose.
+		// Without an intent word, a short fragment is almost always a final answer
+		// ("50", "FILE=x HEADROOM=8", a path, "Yes, it is exported."). Treat it as
+		// a stall only when it visibly trails into an action that never came:
+		// one fragment ending in ":" or an ellipsis, mid-task, really short.
 		const isFragment = !/[.!;:]\s/.test(text.slice(0, -1));
-		if (!isFragment || text.length > Math.min(140, opts.maxChars) || opts.toolResultsSinceUser === 0) {
+		const trailsOff = /(?::|\.\.\.|…)$/.test(text) || (text.length <= 60 && ACTION_START_RE.test(text));
+		if (
+			!isFragment ||
+			!trailsOff ||
+			text.length > Math.min(140, opts.maxChars) ||
+			opts.toolResultsSinceUser === 0
+		) {
 			return { stall: false, reason: "no intent signal" };
 		}
 	}

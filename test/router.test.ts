@@ -579,3 +579,32 @@ test("a self-compact handoff note (the real goal) still counts as the objective"
 	assert.equal(isSyntheticUserMessage(userText(note)), false);
 	assert.equal(lastUserText([userText("old"), userText(note)]), note);
 });
+
+// Regression: short final answers in a subagent were nudged as stalls.
+test("detectStall ignores short final answers without an intent word", () => {
+	const opts = { toolResultsSinceUser: 3, maxChars: 60 };
+	const answers = [
+		"50",
+		"FILE=src/core/limits.ts HEADROOM=8",
+		"src/core/defaults.ts",
+		"Yes, HEADROOM is exported.",
+	];
+	for (const text of answers) {
+		const decision = detectStall({ role: "assistant", stopReason: "stop", content: [{ type: "text", text }] }, opts);
+		assert.equal(decision.stall, false, `false positive on ${JSON.stringify(text)}`);
+	}
+});
+
+test("detectStall still flags a short fragment that trails off mid-task", () => {
+	const opts = { toolResultsSinceUser: 3, maxChars: 60 };
+	for (const text of ["Cek config dulu:", "Membuka file limits.ts…", "Checking the tests...", "Membaca config"]) {
+		const decision = detectStall({ role: "assistant", stopReason: "stop", content: [{ type: "text", text }] }, opts);
+		assert.equal(decision.stall, true, `missed stall on ${JSON.stringify(text)}`);
+	}
+	// Same fragment before any tool result is not a stall.
+	const early = detectStall(
+		{ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Cek config dulu:" }] },
+		{ toolResultsSinceUser: 0, maxChars: 60 },
+	);
+	assert.equal(early.stall, false);
+});
