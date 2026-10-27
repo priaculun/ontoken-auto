@@ -36,7 +36,7 @@ interface FakeModel {
 const MODELS: Record<string, FakeModel> = {
 	"gpt-6-luna": mkModel("gpt-6-luna", { reasoning: true }),
 	"glm-5.3-flash": mkModel("glm-5.3-flash", { reasoning: true, map: { off: null, medium: null, xhigh: null } }),
-	"muse-spark-1.3": mkModel("muse-spark-1.3", { reasoning: true }),
+	"kimi-k3": mkModel("kimi-k3", { reasoning: true }),
 	"claude-sonnet-5.5": mkModel("claude-sonnet-5.5", { reasoning: true }),
 	"gpt-6.1-sol": mkModel("gpt-6.1-sol", { reasoning: true }),
 	"no-reasoning": mkModel("no-reasoning", { reasoning: false }),
@@ -272,7 +272,7 @@ test("user route: hard debug verdict reaches a stronger slot", async () => {
 	resetBuffers(harness);
 	const route = await harness.route(request({ messages: [userMsg("fix this deadlock")] }));
 	assert.equal(route.state?.slot, "solid");
-	assert.equal(route.model.id, "muse-spark-1.3");
+	assert.equal(route.model.id, "kimi-k3");
 });
 
 test("thinking is clamped to the routed model's thinkingLevelMap", async () => {
@@ -348,7 +348,7 @@ test("continuation promotes to a stronger slot when Jev reports harder work", as
 		request({ reason: "continuation", state: first.state!, messages: messages as never }),
 	);
 	assert.equal(next.state?.slot, "solid");
-	assert.equal(next.model.id, "muse-spark-1.3");
+	assert.equal(next.model.id, "kimi-k3");
 	assert.equal(next.state?.adaptiveEvaluations, 1);
 	assert.match(String(next.state?.ruleId), /\+adaptive$/);
 });
