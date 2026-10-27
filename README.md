@@ -265,7 +265,7 @@ rule wins ties):
 |---|---|---|
 | fast | `glm-5.3-flash` | chat / lookup, compaction summaries (`directSlot`); cheapest live model, 2–4 s |
 | work | `glm-5.3-flash` | routine–involved coding |
-| solid | `muse-spark-1.3` | hard debug / design |
+| solid | `kimi-k3` | hard debug / design |
 | strong | `claude-sonnet-5.5` | frontier |
 | frontier | `gpt-6.1-sol` | frontier + heavy reasoning |
 

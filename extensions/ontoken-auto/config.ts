@@ -398,7 +398,7 @@ function normalizeConfig(raw: Record<string, unknown>): AutoConfig {
 	const slots = normalizeSlots(raw.slots, {
 		fast: "glm-5.3-flash",
 		work: "glm-5.3-flash",
-		solid: "muse-spark-1.3",
+		solid: "kimi-k3",
 		strong: "claude-sonnet-5.5",
 		frontier: "gpt-6.1-sol",
 	});
